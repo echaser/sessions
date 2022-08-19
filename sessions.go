@@ -20,11 +20,12 @@
 package sessions
 
 import (
+	"log"
+	"net/http"
+
 	"github.com/go-martini/martini"
 	"github.com/gorilla/context"
 	"github.com/gorilla/sessions"
-	"log"
-	"net/http"
 )
 
 const (
@@ -50,41 +51,51 @@ type Options struct {
 	HttpOnly bool
 }
 
+var _ Session = (*session)(nil)
+
 // Session stores the values and optional configuration for a session.
 type Session interface {
 	// Get returns the session value associated to the given key.
-	Get(key interface{}) interface{}
+	Get(name string, key interface{}) interface{}
 	// Set sets the session value associated to the given key.
-	Set(key interface{}, val interface{})
+	Set(name string, key interface{}, val interface{})
 	// Delete removes the session value associated to the given key.
-	Delete(key interface{})
+	Delete(name string, key interface{})
 	// Clear deletes all values in the session.
-	Clear()
+	Clear(name string)
 	// AddFlash adds a flash message to the session.
 	// A single variadic argument is accepted, and it is optional: it defines the flash key.
 	// If not defined "_flash" is used by default.
-	AddFlash(value interface{}, vars ...string)
+	AddFlash(name string, value interface{}, vars ...string)
 	// Flashes returns a slice of flash messages from the session.
 	// A single variadic argument is accepted, and it is optional: it defines the flash key.
 	// If not defined "_flash" is used by default.
-	Flashes(vars ...string) []interface{}
+	Flashes(name string, vars ...string) []interface{}
 	// Options sets confuguration for a session.
-	Options(Options)
+	Options(name string, opts Options)
 }
 
 // Sessions is a Middleware that maps a session.Session service into the Martini handler chain.
 // Sessions can use a number of storage solutions with the given store.
-func Sessions(name string, store Store) martini.Handler {
+func Sessions(store Store) martini.Handler {
 	return func(res http.ResponseWriter, r *http.Request, c martini.Context, l *log.Logger) {
 		// Map to the Session interface
-		s := &session{name, r, l, store, nil, false}
+		s := &session{
+			ss:      make(map[string]*sessions.Session),
+			written: make(map[string]bool),
+			request: r,
+			store:   store,
+			logger:  l,
+		}
 		c.MapTo(s, (*Session)(nil))
 
 		// Use before hook to save out the session
 		rw := res.(martini.ResponseWriter)
 		rw.Before(func(martini.ResponseWriter) {
-			if s.Written() {
-				check(s.Session().Save(r, res), l)
+			for n := range s.ss {
+				if s.Written(n) {
+					check(s.Session(n).Save(r, res), l)
+				}
 			}
 		})
 
@@ -97,46 +108,45 @@ func Sessions(name string, store Store) martini.Handler {
 }
 
 type session struct {
-	name    string
+	ss      map[string]*sessions.Session
+	written map[string]bool
 	request *http.Request
 	logger  *log.Logger
 	store   Store
-	session *sessions.Session
-	written bool
 }
 
-func (s *session) Get(key interface{}) interface{} {
-	return s.Session().Values[key]
+func (s *session) Get(name string, key interface{}) interface{} {
+	return s.Session(name).Values[key]
 }
 
-func (s *session) Set(key interface{}, val interface{}) {
-	s.Session().Values[key] = val
-	s.written = true
+func (s *session) Set(name string, key interface{}, val interface{}) {
+	s.Session(name).Values[key] = val
+	s.written[name] = true
 }
 
-func (s *session) Delete(key interface{}) {
-	delete(s.Session().Values, key)
-	s.written = true
+func (s *session) Delete(name string, key interface{}) {
+	delete(s.Session(name).Values, key)
+	s.written[name] = true
 }
 
-func (s *session) Clear() {
-	for key := range s.Session().Values {
-		s.Delete(key)
+func (s *session) Clear(name string) {
+	for key := range s.Session(name).Values {
+		s.Delete(name, key)
 	}
 }
 
-func (s *session) AddFlash(value interface{}, vars ...string) {
-	s.Session().AddFlash(value, vars...)
-	s.written = true
+func (s *session) AddFlash(name string, value interface{}, vars ...string) {
+	s.Session(name).AddFlash(value, vars...)
+	s.written[name] = true
 }
 
-func (s *session) Flashes(vars ...string) []interface{} {
-	s.written = true
-	return s.Session().Flashes(vars...)
+func (s *session) Flashes(name string, vars ...string) []interface{} {
+	s.written[name] = true
+	return s.Session(name).Flashes(vars...)
 }
 
-func (s *session) Options(options Options) {
-	s.Session().Options = &sessions.Options{
+func (s *session) Options(name string, options Options) {
+	s.Session(name).Options = &sessions.Options{
 		Path:     options.Path,
 		Domain:   options.Domain,
 		MaxAge:   options.MaxAge,
@@ -145,18 +155,18 @@ func (s *session) Options(options Options) {
 	}
 }
 
-func (s *session) Session() *sessions.Session {
-	if s.session == nil {
+func (s *session) Session(name string) *sessions.Session {
+	if s.ss[name] == nil {
 		var err error
-		s.session, err = s.store.Get(s.request, s.name)
+		s.ss[name], err = s.store.Get(s.request, name)
 		check(err, s.logger)
 	}
 
-	return s.session
+	return s.ss[name]
 }
 
-func (s *session) Written() bool {
-	return s.written
+func (s *session) Written(name string) bool {
+	return s.written[name]
 }
 
 func check(err error, l *log.Logger) {
